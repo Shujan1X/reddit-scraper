@@ -1,2 +1,0 @@
-# reddit-scraper
-reddit-scraper
