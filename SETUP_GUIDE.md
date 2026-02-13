@@ -1,7 +1,5 @@
 # Overwatch Reddit Scraper - Cloudflare Worker Version
 
-https://scraper.gk091818.workers.dev/
-
 ## 🎯 What This Does
 
 Scrapes **posts AND comments** from r/Overwatch (or any subreddit) using Cloudflare Workers - **NO Reddit API keys needed!**
