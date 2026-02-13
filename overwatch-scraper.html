@@ -44,6 +44,28 @@
       padding: 40px;
     }
     
+    .alert {
+      padding: 20px;
+      background: #fff3cd;
+      border: 2px solid #ffc107;
+      border-radius: 10px;
+      margin-bottom: 30px;
+    }
+    
+    .alert h3 {
+      color: #856404;
+      margin-bottom: 10px;
+    }
+    
+    .alert ol {
+      color: #856404;
+      margin-left: 20px;
+    }
+    
+    .alert li {
+      margin: 5px 0;
+    }
+    
     .controls {
       display: grid;
       gap: 20px;
@@ -72,6 +94,10 @@
     .input-group input:focus, .input-group select:focus {
       outline: none;
       border-color: #667eea;
+    }
+    
+    .input-group input.error {
+      border-color: #f44336;
     }
     
     .btn {
@@ -235,19 +261,31 @@
     </div>
     
     <div class="content">
+      <div class="alert">
+        <h3>⚠️ Setup Required!</h3>
+        <p><strong>Before using this scraper, you must:</strong></p>
+        <ol>
+          <li>Deploy the Cloudflare Worker using <code>worker-simple.js</code></li>
+          <li>Copy your worker URL (looks like: https://your-worker.workers.dev)</li>
+          <li>Paste it in the field below</li>
+        </ol>
+        <p style="margin-top: 10px;"><strong>Don't have a worker URL yet?</strong> Follow the <code>DEPLOYMENT_GUIDE.md</code> file!</p>
+      </div>
+      
       <div class="controls">
         <div class="input-group">
-          <label for="workerUrl">Cloudflare Worker URL:</label>
+          <label for="workerUrl">🔗 Cloudflare Worker URL: *</label>
           <input 
             type="text" 
             id="workerUrl" 
-            placeholder="https://your-worker.workers.dev"
-            value="YOUR_WORKER_URL_HERE"
+            placeholder="https://reddit-scraper.YOUR-NAME.workers.dev"
+            value=""
           >
+          <small style="color: #666;">Example: https://reddit-scraper.john123.workers.dev</small>
         </div>
         
         <div class="input-group">
-          <label for="subreddit">Subreddit:</label>
+          <label for="subreddit">📱 Subreddit:</label>
           <select id="subreddit">
             <option value="Overwatch">r/Overwatch</option>
             <option value="Competitiveoverwatch">r/Competitiveoverwatch</option>
@@ -257,13 +295,13 @@
         </div>
         
         <div class="input-group">
-          <label for="numPosts">Number of Posts:</label>
-          <input type="number" id="numPosts" value="10" min="1" max="50">
+          <label for="numPosts">📊 Number of Posts:</label>
+          <input type="number" id="numPosts" value="5" min="1" max="25">
         </div>
         
         <div class="input-group">
-          <label for="commentsPerPost">Comments per Post:</label>
-          <input type="number" id="commentsPerPost" value="20" min="1" max="50">
+          <label for="commentsPerPost">💬 Comments per Post:</label>
+          <input type="number" id="commentsPerPost" value="15" min="1" max="30">
         </div>
         
         <button class="btn btn-primary" onclick="startScraping()" id="scrapeBtn">
@@ -323,15 +361,34 @@
     }
     
     async function startScraping() {
-      const workerUrl = document.getElementById('workerUrl').value.trim();
+      const workerUrlInput = document.getElementById('workerUrl');
+      const workerUrl = workerUrlInput.value.trim();
       const subreddit = document.getElementById('subreddit').value;
       const numPosts = parseInt(document.getElementById('numPosts').value);
       const commentsPerPost = parseInt(document.getElementById('commentsPerPost').value);
       
-      if (!workerUrl || workerUrl === 'YOUR_WORKER_URL_HERE') {
-        showStatus('Please enter your Cloudflare Worker URL!', 'error');
+      // Validate worker URL
+      if (!workerUrl) {
+        showStatus('❌ Please enter your Cloudflare Worker URL!', 'error');
+        workerUrlInput.classList.add('error');
+        workerUrlInput.focus();
         return;
       }
+      
+      if (!workerUrl.startsWith('http://') && !workerUrl.startsWith('https://')) {
+        showStatus('❌ Worker URL must start with https:// or http://', 'error');
+        workerUrlInput.classList.add('error');
+        workerUrlInput.focus();
+        return;
+      }
+      
+      if (!workerUrl.includes('workers.dev') && !workerUrl.includes('localhost')) {
+        showStatus('⚠️ Warning: URL doesn\'t look like a Cloudflare Worker URL. It should contain "workers.dev"', 'error');
+        workerUrlInput.classList.add('error');
+        return;
+      }
+      
+      workerUrlInput.classList.remove('error');
       
       // Disable button and show loading
       document.getElementById('scrapeBtn').disabled = true;
@@ -340,7 +397,7 @@
       hideStatus();
       
       try {
-        showStatus('Scraping data from Reddit...', 'info');
+        showStatus('🔍 Connecting to worker...', 'info');
         
         const response = await fetch(`${workerUrl}/scrape`, {
           method: 'POST',
@@ -353,9 +410,16 @@
         });
         
         if (!response.ok) {
-          throw new Error('Failed to fetch data from worker');
+          throw new Error(`Worker responded with status ${response.status}. Make sure your worker is deployed correctly.`);
         }
         
+        // Check if response is JSON
+        const contentType = response.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          throw new Error('Worker is not returning JSON. Make sure you deployed worker-simple.js correctly and the URL ends with /scrape');
+        }
+        
+        showStatus('📥 Downloading data from Reddit...', 'info');
         scrapedData = await response.json();
         
         if (scrapedData.error) {
@@ -368,7 +432,16 @@
         showStatus(`✅ Successfully scraped ${scrapedData.posts.length} posts and ${scrapedData.comments.length} comments!`, 'success');
         
       } catch (error) {
-        showStatus(`❌ Error: ${error.message}`, 'error');
+        let errorMessage = error.message;
+        
+        // Provide helpful error messages
+        if (errorMessage.includes('Failed to fetch') || errorMessage.includes('NetworkError')) {
+          errorMessage = '❌ Cannot connect to worker. Check:\n1. Worker URL is correct\n2. Worker is deployed\n3. URL ends with /scrape\n4. Your internet connection is working';
+        } else if (errorMessage.includes('not valid JSON')) {
+          errorMessage = '❌ Worker is not returning data correctly. Make sure:\n1. You deployed worker-simple.js (not the old version)\n2. The code was copied completely\n3. You clicked "Save and Deploy"';
+        }
+        
+        showStatus(errorMessage, 'error');
         console.error('Scraping error:', error);
       } finally {
         document.getElementById('scrapeBtn').disabled = false;
