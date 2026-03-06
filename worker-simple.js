@@ -1,5 +1,5 @@
-// Cloudflare Worker - Reddit Scraper with Sorting & Date Filtering
-// Supports: hot, new, top, rising, best
+// Cloudflare Worker - Reddit Scraper with Exclusive Filtering
+// Either Sort-Based (hot/new/top/rising/best) OR Date-Based filtering
 
 export default {
   async fetch(request) {
@@ -25,17 +25,22 @@ export default {
         const commentsPerPost = Math.min(50, body.commentsPerPost || 20);
         const startDate = body.startDate || null;
         const endDate = body.endDate || null;
-        const sortBy = body.sortBy || "new";  // hot, new, top, rising, best
-        const timeFilter = body.timeFilter || "all";  // hour, day, week, month, year, all (for 'top')
+        const sortBy = body.sortBy || null;
+        const timeFilter = body.timeFilter || "all";
+        
+        // Determine filtering mode
+        const useDate = startDate || endDate;
+        const filterMode = useDate ? "date" : "sort";
 
-        const result = await scrapeRedditWithFilters(
+        const result = await scrapeReddit(
           subreddit, 
           limit, 
           commentsPerPost,
           startDate,
           endDate,
           sortBy,
-          timeFilter
+          timeFilter,
+          filterMode
         );
         
         return new Response(JSON.stringify(result), {
@@ -56,55 +61,76 @@ export default {
     }
 
     // Default response
-    return new Response("Reddit Scraper API - POST to /scrape\nSupports: hot, new, top, rising, best + date filtering", {
+    return new Response("Reddit Scraper API - Exclusive filtering: Sort OR Date", {
       headers: { "Access-Control-Allow-Origin": "*" }
     });
   }
 };
 
-// Main scraping function with filters
-async function scrapeRedditWithFilters(subreddit, limit, commentsPerPost, startDate, endDate, sortBy, timeFilter) {
+// Main scraping function
+async function scrapeReddit(subreddit, limit, commentsPerPost, startDate, endDate, sortBy, timeFilter, filterMode) {
   const posts = [];
   const allComments = [];
   const dailyStats = {};
   
-  // Parse dates
-  let startDateTime = startDate ? new Date(startDate + "T00:00:00Z") : null;
-  let endDateTime = endDate ? new Date(endDate + "T23:59:59Z") : null;
+  let allPosts = [];
   
-  // Get posts with sorting
-  const maxPostsToCheck = limit * 3;
-  const allPosts = await getPostsWithSort(subreddit, maxPostsToCheck, sortBy, timeFilter);
-  
-  // Filter posts by date if dates are provided
-  const filteredPosts = [];
-  for (const post of allPosts) {
-    const postDate = new Date(post.created_utc);
+  if (filterMode === "date") {
+    // DATE MODE: Get posts chronologically and filter by date
+    console.log("Using DATE filtering mode");
     
-    // Check date range (only if dates are provided)
-    if (startDateTime && postDate < startDateTime) continue;
-    if (endDateTime && postDate > endDateTime) continue;
+    const startDateTime = startDate ? new Date(startDate + "T00:00:00Z") : null;
+    const endDateTime = endDate ? new Date(endDate + "T23:59:59Z") : null;
     
-    filteredPosts.push(post);
+    // Get posts sorted by NEW (chronological) for date filtering
+    const maxPostsToCheck = limit * 5;
+    allPosts = await getPostsWithSort(subreddit, maxPostsToCheck, "new", "all");
     
-    // Track daily stats
-    const dateKey = post.created_utc.split('T')[0];
-    if (!dailyStats[dateKey]) {
-      dailyStats[dateKey] = 0;
+    // Filter by date range
+    for (const post of allPosts) {
+      const postDate = new Date(post.created_utc);
+      
+      if (startDateTime && postDate < startDateTime) continue;
+      if (endDateTime && postDate > endDateTime) continue;
+      
+      posts.push(post);
+      
+      // Track daily stats
+      const dateKey = post.created_utc.split('T')[0];
+      if (!dailyStats[dateKey]) {
+        dailyStats[dateKey] = 0;
+      }
+      dailyStats[dateKey]++;
+      
+      if (posts.length >= limit) break;
     }
-    dailyStats[dateKey]++;
     
-    // Stop if we have enough
-    if (filteredPosts.length >= limit) break;
+  } else {
+    // SORT MODE: Get posts by sort type, ignore dates
+    console.log("Using SORT filtering mode");
+    
+    const actualSort = sortBy || "new";
+    allPosts = await getPostsWithSort(subreddit, limit, actualSort, timeFilter);
+    
+    // Take all posts (no date filtering)
+    for (const post of allPosts) {
+      posts.push(post);
+      
+      // Track daily stats
+      const dateKey = post.created_utc.split('T')[0];
+      if (!dailyStats[dateKey]) {
+        dailyStats[dateKey] = 0;
+      }
+      dailyStats[dateKey]++;
+      
+      if (posts.length >= limit) break;
+    }
   }
   
-  // Get comments for filtered posts
-  for (const post of filteredPosts) {
-    posts.push(post);
-    
+  // Get comments for all posts
+  for (const post of posts) {
     const comments = await getComments(post.permalink, commentsPerPost);
     
-    // Add post info to comments
     for (const comment of comments) {
       comment.post_title = post.title;
       comment.post_url = post.url;
@@ -122,8 +148,9 @@ async function scrapeRedditWithFilters(subreddit, limit, commentsPerPost, startD
     stats: {
       totalPosts: posts.length,
       totalComments: allComments.length,
-      sortBy: sortBy,
-      timeFilter: timeFilter,
+      filterMode: filterMode,
+      sortBy: filterMode === "sort" ? (sortBy || "new") : "new (for date filtering)",
+      timeFilter: filterMode === "sort" ? timeFilter : "N/A",
       dateRange: {
         start: startDate || "No limit",
         end: endDate || "No limit"
@@ -138,7 +165,6 @@ async function getPostsWithSort(subreddit, maxPosts, sortBy, timeFilter) {
   const allPosts = [];
   let after = null;
   
-  // Map sorting options to Reddit endpoints
   const sortMap = {
     'hot': 'hot',
     'new': 'new',
@@ -151,15 +177,12 @@ async function getPostsWithSort(subreddit, maxPosts, sortBy, timeFilter) {
   
   while (allPosts.length < maxPosts) {
     try {
-      // Build URL based on sort type
       let url = `https://www.reddit.com/r/${subreddit}/${sortEndpoint}.json?limit=100`;
       
-      // Add time filter for 'top' sort
       if (sortBy === 'top') {
         url += `&t=${timeFilter}`;
       }
       
-      // Add pagination
       if (after) {
         url += `&after=${after}`;
       }
@@ -180,7 +203,6 @@ async function getPostsWithSort(subreddit, maxPosts, sortBy, timeFilter) {
       for (const child of children) {
         const p = child.data;
         
-        // Skip stickied and NSFW posts
         if (p.stickied || p.over_18) continue;
         
         allPosts.push({
@@ -204,7 +226,6 @@ async function getPostsWithSort(subreddit, maxPosts, sortBy, timeFilter) {
         if (allPosts.length >= maxPosts) break;
       }
       
-      // Get pagination token
       after = data?.data?.after;
       if (!after) break;
       
@@ -259,7 +280,6 @@ async function getComments(permalink, limit) {
           awards: c.total_awards_received || 0
         });
         
-        // Get replies
         if (depth < 2 && comments.length < limit && c.replies && c.replies.data) {
           const replies = c.replies.data.children || [];
           extractComments(replies, depth + 1);
