@@ -128,7 +128,7 @@ input[type='range'] {
 >
     <option value="hot">Hot</option>
     <option value="new">New</option>
-    <option value="top">Top (All Time)</option>
+    <option value="top" selected>Top (All Time)</option>
     <option value="rising">Rising</option>
     <option value="best">Best</option>
 </select>
@@ -199,13 +199,20 @@ input[type='range'] {
 </div>
 
 <!-- Start Button -->
-<div class="pt-4">
+<div class="pt-4 flex gap-3">
 <button 
     id="startBtn"
     onclick="startScraping()"
     class="px-8 py-3.5 bg-primary-teal text-white rounded font-bold text-[11px] uppercase tracking-widest hover:brightness-95 transition-all flex items-center justify-center gap-2 shadow-sm shadow-teal-100 disabled:opacity-50 disabled:cursor-not-allowed"
 >
     Start Scraping <span class="material-symbols-outlined text-base">play_arrow</span>
+</button>
+<button 
+    id="loadMoreBtn"
+    onclick="loadMore()"
+    class="px-8 py-3.5 bg-slate-600 text-white rounded font-bold text-[11px] uppercase tracking-widest hover:brightness-95 transition-all flex items-center justify-center gap-2 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed hidden"
+>
+    Load More <span class="material-symbols-outlined text-base">add</span>
 </button>
 </div>
 </div>
@@ -315,6 +322,7 @@ input[type='range'] {
     id="exportBtn"
     onclick="exportCSV()"
     class="p-5 border border-slate-200 bg-white rounded flex flex-col items-center text-center hover:border-primary-teal hover:bg-slate-50 transition-all disabled:opacity-60 disabled:grayscale disabled:cursor-not-allowed"
+    disabled
 >
 <span class="material-symbols-outlined text-primary-teal text-2xl mb-2">download</span>
 <h4 class="font-bold text-slate-600 uppercase text-[9px] tracking-widest">Download CSV</h4>
@@ -335,8 +343,8 @@ input[type='range'] {
 <div class="flex items-center justify-between mb-6">
 <h2 class="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">Activity</h2>
 <span class="flex items-center gap-1.5">
-<span class="w-1.5 h-1.5 bg-slate-300 rounded-full" id="statusDot"></span>
-<span class="text-[9px] font-bold text-slate-400 uppercase" id="statusLabel">Offline</span>
+<span class="w-2 h-2 bg-slate-300 rounded-full" id="statusDot"></span>
+<span class="text-[10px] font-bold text-slate-400 uppercase tracking-widest" id="statusLabel">Offline</span>
 </span>
 </div>
 <div class="grid grid-cols-2 gap-3">
@@ -367,7 +375,7 @@ input[type='range'] {
 </div>
 
 <div class="p-6 border-t border-slate-200">
-<a class="flex items-center gap-3 text-slate-400 hover:text-slate-600 transition-colors" href="#" onclick="alert('Documentation coming soon!')">
+<a class="flex items-center gap-3 text-slate-400 hover:text-slate-600 transition-colors" href="#" onclick="alert('Documentation coming soon!'); return false;">
 <span class="material-symbols-outlined text-sm">help</span>
 <p class="text-[10px] font-bold uppercase tracking-widest">Documentation</p>
 </a>
@@ -377,11 +385,14 @@ input[type='range'] {
 
 <script>
 let scrapedData = null;
+let allPosts = [];
+let allComments = [];
+let currentCursor = null; // For pagination
+let currentFilterMode = 'sort';
 
 function updateFilterMode() {
-    const mode = document.querySelector('input[name="filterMode"]:checked').value;
-    document.querySelectorAll('.sort-config').forEach(el => el.style.display = mode === 'sort' ? 'block' : 'none');
-    document.querySelectorAll('.date-config').forEach(el => el.style.display = mode === 'date' ? 'grid' : 'none');
+    const selected = document.querySelector('input[name="filterMode"]:checked').value;
+    currentFilterMode = selected;
 }
 
 function updateSliderValue(sliderId, labelId, suffix) {
@@ -402,9 +413,11 @@ function addLiveFeedItem(type, text) {
             </div>
         </div>
     `;
+    
     if (feed.children[0]?.classList.contains('justify-center')) {
         feed.innerHTML = '';
     }
+    
     feed.insertBefore(item, feed.firstChild);
     if (feed.children.length > 10) feed.removeChild(feed.lastChild);
 }
@@ -419,128 +432,214 @@ function updateProgress(percent, current, total) {
     document.getElementById('currentTask').textContent = `Processing item ${current} of ${total}...`;
 }
 
-async function startScraping() {
-    const workerUrl      = document.getElementById('workerUrl').value.trim();
-    const subreddit      = document.getElementById('subreddit').value.trim();
-    const postLimit      = parseInt(document.getElementById('postLimit').value);
-    const commentsLimit  = parseInt(document.getElementById('commentsLimit').value);
+async function scrapeWithCursor(workerUrl, requestBody, isLoadMore = false) {
+    const response = await fetch(`${workerUrl}/scrape`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+    });
+    
+    if (!response.ok) throw new Error(`Worker error: HTTP ${response.status}`);
+    
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    
+    return data;
+}
 
+async function startScraping() {
+    const workerUrl = document.getElementById('workerUrl').value.trim();
+    const subreddit = document.getElementById('subreddit').value.trim();
+    const postLimit = parseInt(document.getElementById('postLimit').value);
+    const commentsLimit = parseInt(document.getElementById('commentsLimit').value);
+    
     if (!workerUrl) {
         alert('Please enter your Cloudflare Worker URL!');
         return;
     }
+    
     if (!subreddit) {
         alert('Please enter a subreddit name!');
         return;
     }
-
-    // Always read fresh from DOM
+    
+    // Reset pagination
+    currentCursor = null;
+    allPosts = [];
+    allComments = [];
+    
     const filterMode = document.querySelector('input[name="filterMode"]:checked').value;
-
     const btn = document.getElementById('startBtn');
     btn.disabled = true;
-
-    document.getElementById('statusDot').className   = 'w-2 h-2 rounded-full bg-green-500';
+    
+    document.getElementById('statusDot').className = 'w-2 h-2 rounded-full bg-green-500';
     document.getElementById('statusLabel').textContent = 'ONLINE';
-    document.getElementById('statusLabel').className  = 'text-[10px] font-bold uppercase tracking-widest text-green-600';
+    document.getElementById('statusLabel').className = 'text-[10px] font-bold uppercase tracking-widest text-green-600';
     document.getElementById('monitorSection').setAttribute('open', '');
-
-    // Build request body
+    
     const requestBody = {
         subreddit,
-        limit:          postLimit,
+        limit: postLimit,
         commentsPerPost: commentsLimit,
-        filterMode      // always tell the worker which mode
+        filterMode,
+        afterCursor: null // First scrape, no cursor
     };
-
+    
     if (filterMode === 'date') {
         const startDate = document.getElementById('startDate').value;
-        const endDate   = document.getElementById('endDate').value;
-
+        const endDate = document.getElementById('endDate').value;
+        
         if (!startDate && !endDate) {
             alert('Please enter at least a Start Date or End Date.');
             btn.disabled = false;
             return;
         }
-
+        
         requestBody.startDate = startDate || null;
-        requestBody.endDate   = endDate   || null;
-        requestBody.sortBy    = null;
+        requestBody.endDate = endDate || null;
+        requestBody.sortBy = null;
     } else {
-        requestBody.sortBy    = document.getElementById('sortOrder').value;
-        requestBody.timeFilter = document.getElementById('timeFilter') ? document.getElementById('timeFilter').value : 'all';
+        requestBody.sortBy = document.getElementById('sortOrder').value;
+        requestBody.timeFilter = 'all';
         requestBody.startDate = null;
-        requestBody.endDate   = null;
+        requestBody.endDate = null;
     }
-
+    
     try {
         let progress = 0;
         const progressInterval = setInterval(() => {
             progress += 2;
             if (progress <= 90) updateProgress(progress, Math.floor(postLimit * progress / 100), postLimit);
         }, 200);
-
-        const response = await fetch(`${workerUrl}/scrape`, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify(requestBody)
-        });
-
+        
+        const data = await scrapeWithCursor(workerUrl, requestBody);
+        
         clearInterval(progressInterval);
-
-        if (!response.ok) throw new Error(`Worker error: HTTP ${response.status}`);
-
-        const data = await response.json();
-        if (data.error) throw new Error(data.error);
-
+        
         scrapedData = data;
-
+        currentCursor = data.nextCursor; // Save cursor for next page
+        
+        // Accumulate data
+        allPosts = data.posts || [];
+        allComments = data.comments || [];
+        
         updateProgress(100, postLimit, postLimit);
-
-        const totalItems = (data.posts?.length || 0) + (data.comments?.length || 0);
+        
+        const totalItems = allPosts.length + allComments.length;
         document.getElementById('totalItems').textContent = totalItems.toLocaleString();
-        document.getElementById('totalPosts').textContent = (data.posts?.length || 0).toLocaleString();
-
-        displayResults(data);
-
+        document.getElementById('totalPosts').textContent = allPosts.length.toLocaleString();
+        
+        displayResults({ posts: allPosts, comments: allComments });
+        
         setTimeout(() => document.getElementById('resultsSection').setAttribute('open', ''), 500);
         document.getElementById('exportBtn').disabled = false;
-
+        
+        // Show "Load More" button if there's a next cursor
+        if (currentCursor) {
+            document.getElementById('loadMoreBtn').classList.remove('hidden');
+        } else {
+            document.getElementById('loadMoreBtn').classList.add('hidden');
+        }
+        
     } catch (error) {
         alert(`Error: ${error.message}`);
         updateProgress(0, 0, postLimit);
     } finally {
         btn.disabled = false;
-        document.getElementById('statusDot').className   = 'w-2 h-2 rounded-full bg-slate-300';
+        document.getElementById('statusDot').className = 'w-2 h-2 rounded-full bg-slate-300';
         document.getElementById('statusLabel').textContent = 'OFFLINE';
-        document.getElementById('statusLabel').className  = 'text-[10px] font-bold uppercase tracking-widest text-slate-400';
+        document.getElementById('statusLabel').className = 'text-[10px] font-bold uppercase tracking-widest text-slate-400';
+    }
+}
+
+async function loadMore() {
+    if (!currentCursor) {
+        alert('No more data to load!');
+        return;
+    }
+    
+    const workerUrl = document.getElementById('workerUrl').value.trim();
+    const subreddit = document.getElementById('subreddit').value.trim();
+    const postLimit = parseInt(document.getElementById('postLimit').value);
+    const commentsLimit = parseInt(document.getElementById('commentsLimit').value);
+    const filterMode = document.querySelector('input[name="filterMode"]:checked').value;
+    
+    const loadMoreBtn = document.getElementById('loadMoreBtn');
+    loadMoreBtn.disabled = true;
+    loadMoreBtn.textContent = 'Loading...';
+    
+    const requestBody = {
+        subreddit,
+        limit: postLimit,
+        commentsPerPost: commentsLimit,
+        filterMode,
+        afterCursor: currentCursor // Use saved cursor
+    };
+    
+    if (filterMode === 'date') {
+        requestBody.startDate = document.getElementById('startDate').value || null;
+        requestBody.endDate = document.getElementById('endDate').value || null;
+        requestBody.sortBy = null;
+    } else {
+        requestBody.sortBy = document.getElementById('sortOrder').value;
+        requestBody.timeFilter = 'all';
+        requestBody.startDate = null;
+        requestBody.endDate = null;
+    }
+    
+    try {
+        const data = await scrapeWithCursor(workerUrl, requestBody, true);
+        
+        currentCursor = data.nextCursor; // Update cursor
+        
+        // Append new data
+        allPosts = [...allPosts, ...(data.posts || [])];
+        allComments = [...allComments, ...(data.comments || [])];
+        
+        const totalItems = allPosts.length + allComments.length;
+        document.getElementById('totalItems').textContent = totalItems.toLocaleString();
+        document.getElementById('totalPosts').textContent = allPosts.length.toLocaleString();
+        
+        displayResults({ posts: allPosts, comments: allComments });
+        
+        // Hide button if no more data
+        if (!currentCursor) {
+            loadMoreBtn.classList.add('hidden');
+            alert('All data loaded!');
+        }
+        
+    } catch (error) {
+        alert(`Error loading more: ${error.message}`);
+    } finally {
+        loadMoreBtn.disabled = false;
+        loadMoreBtn.innerHTML = 'Load More <span class="material-symbols-outlined text-base">add</span>';
     }
 }
 
 function displayResults(data) {
     const tbody = document.getElementById('dataTableBody');
     const items = [];
-
+    
     if (data.posts) {
         data.posts.forEach(post => {
             items.push({ type: 'POST', content: post.title, author: post.author, upvotes: post.score || 0, date: new Date(post.created_utc).toLocaleDateString(), url: post.url });
             addLiveFeedItem('post', post.title);
         });
     }
-
+    
     if (data.comments) {
         data.comments.forEach(comment => {
             items.push({ type: 'COMMENT', content: comment.text, author: comment.author, upvotes: comment.score || 0, date: new Date(comment.created_utc).toLocaleDateString(), post: comment.post_title });
-            if (Math.random() > 0.7) addLiveFeedItem('comment', comment.text.substring(0, 50) + '...');
+            if (Math.random() > 0.8) addLiveFeedItem('comment', comment.text.substring(0, 50) + '...');
         });
     }
-
+    
     if (items.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-12 text-slate-400 text-sm">No data found. Try a different date range or sort filter.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-12 text-slate-400 text-sm">No data found.</td></tr>';
         return;
     }
-
-    tbody.innerHTML = items.slice(0, 20).map(item => `
+    
+    tbody.innerHTML = items.slice(0, 50).map(item => `
         <tr class="border-b border-slate-100 hover:bg-slate-50">
             <td class="py-3 px-4">
                 <span class="inline-flex items-center px-2 py-1 rounded text-[9px] font-bold uppercase ${item.type === 'POST' ? 'bg-primary-teal/10 text-primary-teal' : 'bg-slate-200 text-slate-600'}">
@@ -564,19 +663,22 @@ function displayResults(data) {
 }
 
 function exportCSV() {
-    if (!scrapedData) { alert('No data to export. Run the scraper first!'); return; }
-
-    const headers = ['Type','Content','Author','Upvotes','Date','Post Title (if comment)','URL'];
-    const rows    = [];
-
-    (scrapedData.posts || []).forEach(p => rows.push(['POST', p.title, p.author, p.score||0, new Date(p.created_utc).toISOString(), '', p.url]));
-    (scrapedData.comments || []).forEach(c => rows.push(['COMMENT', c.text, c.author, c.score||0, new Date(c.created_utc).toISOString(), c.post_title, c.post_url]));
-
-    const csv  = [headers, ...rows].map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+    if (allPosts.length === 0 && allComments.length === 0) {
+        alert('No data to export. Run the scraper first!');
+        return;
+    }
+    
+    const headers = ['Type', 'Content', 'Author', 'Upvotes', 'Date', 'Post Title (if comment)', 'URL'];
+    const rows = [];
+    
+    allPosts.forEach(p => rows.push(['POST', p.title, p.author, p.score || 0, new Date(p.created_utc).toISOString(), '', p.url]));
+    allComments.forEach(c => rows.push(['COMMENT', c.text, c.author, c.score || 0, new Date(c.created_utc).toISOString(), c.post_title, c.post_url]));
+    
+    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
     a.download = `reddit_data_${Date.now()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
