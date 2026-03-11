@@ -1,5 +1,5 @@
 // Cloudflare Worker - Reddit Scraper
-// Supports Sort-Based OR Date-Based filtering based on user preference
+// Supports Sort-Based OR Date-Based filtering + Cursor-Based Pagination
 
 export default {
   async fetch(request) {
@@ -18,18 +18,19 @@ export default {
     if (request.method === "POST" && url.pathname === "/scrape") {
       try {
         const body = await request.json();
-        const subreddit  = body.subreddit      || "Overwatch";
-        const limit      = Math.min(100, body.limit          || 25);
-        const commentsPerPost = Math.min(50,  body.commentsPerPost || 20);
-        const startDate  = body.startDate      || null;
-        const endDate    = body.endDate        || null;
-        const sortBy     = body.sortBy         || null;
-        const timeFilter = body.timeFilter     || "all";
-        const filterMode = body.filterMode     || ((startDate || endDate) ? "date" : "sort");
+        const subreddit = body.subreddit || "Overwatch";
+        const limit = Math.min(100, body.limit || 25);
+        const commentsPerPost = Math.min(50, body.commentsPerPost || 20);
+        const startDate = body.startDate || null;
+        const endDate = body.endDate || null;
+        const sortBy = body.sortBy || null;
+        const timeFilter = body.timeFilter || "all";
+        const filterMode = body.filterMode || ((startDate || endDate) ? "date" : "sort");
+        const afterCursor = body.afterCursor || null; // ← NEW
 
         const result = await scrapeReddit(
           subreddit, limit, commentsPerPost,
-          startDate, endDate, sortBy, timeFilter, filterMode
+          startDate, endDate, sortBy, timeFilter, filterMode, afterCursor
         );
 
         return new Response(JSON.stringify(result), {
@@ -55,24 +56,23 @@ export default {
   }
 };
 
-async function scrapeReddit(subreddit, limit, commentsPerPost, startDate, endDate, sortBy, timeFilter, filterMode) {
-  const posts      = [];
+async function scrapeReddit(subreddit, limit, commentsPerPost, startDate, endDate, sortBy, timeFilter, filterMode, afterCursor) {
+  const posts = [];
   const allComments = [];
-  const dailyStats  = {};
+  const dailyStats = {};
+  let nextCursor = null; // ← NEW: will be returned to browser
 
   if (filterMode === "date") {
     const startDateTime = startDate ? new Date(startDate + "T00:00:00Z") : null;
-    const endDateTime   = endDate   ? new Date(endDate   + "T23:59:59Z") : null;
+    const endDateTime = endDate ? new Date(endDate + "T23:59:59Z") : null;
 
-    // Fetch up to 1000 posts sorted by new; stop early once older than startDate
-    const rawPosts = await getPostsChronological(subreddit, 1000, startDateTime);
+    // ← CHANGED: now returns { posts, nextCursor }
+    const { posts: rawPosts, nextCursor: cursor } = await getPostsChronological(subreddit, 1000, startDateTime, afterCursor);
+    nextCursor = cursor;
 
     for (const post of rawPosts) {
       const postDate = new Date(post.created_utc);
-
-      // Posts come newest-first; once older than startDate we can stop
       if (startDateTime && postDate < startDateTime) break;
-      // Skip posts that are newer than endDate
       if (endDateTime && postDate > endDateTime) continue;
 
       posts.push(post);
@@ -82,9 +82,11 @@ async function scrapeReddit(subreddit, limit, commentsPerPost, startDate, endDat
     }
 
   } else {
-    // SORT MODE — no date filtering at all
     const actualSort = sortBy || "new";
-    const rawPosts   = await getPostsBySort(subreddit, limit, actualSort, timeFilter);
+
+    // ← CHANGED: now returns { posts, nextCursor }
+    const { posts: rawPosts, nextCursor: cursor } = await getPostsBySort(subreddit, limit, actualSort, timeFilter, afterCursor);
+    nextCursor = cursor;
 
     for (const post of rawPosts) {
       posts.push(post);
@@ -94,41 +96,46 @@ async function scrapeReddit(subreddit, limit, commentsPerPost, startDate, endDat
     }
   }
 
-  // Fetch comments for every collected post
-  for (const post of posts) {
-    const comments = await getComments(post.permalink, commentsPerPost);
-    for (const c of comments) {
-      c.post_title = post.title;
-      c.post_url   = post.url;
-      c.post_id    = post.id;
-      c.post_date  = post.created_utc.split("T")[0];
-    }
-    allComments.push(...comments);
-  }
+ const commentPromises = posts.map(async (post) => {
+  const comments = await getComments(post.permalink, commentsPerPost);
+
+  return comments.map(c => ({
+    ...c,
+    post_title: post.title,
+    post_url: post.url,
+    post_id: post.id,
+    post_date: post.created_utc.split("T")[0]
+  }));
+});
+
+const commentsResults = await Promise.all(commentPromises);
+commentsResults.forEach(c => allComments.push(...c)); 
 
   return {
     posts,
     comments: allComments,
     dailyStats,
+    nextCursor, // ← NEW: browser saves this for next call
     stats: {
-      totalPosts:    posts.length,
+      totalPosts: posts.length,
       totalComments: allComments.length,
       filterMode,
-      sortBy:     filterMode === "sort" ? (sortBy || "new") : "new (date mode)",
+      sortBy: filterMode === "sort" ? (sortBy || "new") : "new (date mode)",
       timeFilter: filterMode === "sort" ? timeFilter : "N/A",
       dateRange: {
         start: startDate || "No limit",
-        end:   endDate   || "No limit"
+        end: endDate || "No limit"
       },
       scrapedAt: new Date().toISOString()
     }
   };
 }
 
-// For DATE mode: fetch newest posts and stop once we pass startDate
-async function getPostsChronological(subreddit, maxPosts, stopBeforeDate) {
+// ← CHANGED: accepts initialAfter, returns { posts, nextCursor }
+async function getPostsChronological(subreddit, maxPosts, stopBeforeDate, initialAfter) {
   const allPosts = [];
-  let after = null;
+  let after = initialAfter || null;
+  let lastAfter = null;
 
   while (allPosts.length < maxPosts) {
     try {
@@ -144,19 +151,17 @@ async function getPostsChronological(subreddit, maxPosts, stopBeforeDate) {
         break;
       }
 
-      const data     = await res.json();
+      const data = await res.json();
       const children = data?.data?.children || [];
       if (children.length === 0) break;
 
       let hitBoundary = false;
 
       for (const child of children) {
-        const p        = child.data;
+        const p = child.data;
         if (p.stickied || p.over_18) continue;
 
         const postTime = new Date((p.created_utc || 0) * 1000);
-
-        // Stop entirely once posts are older than our start date
         if (stopBeforeDate && postTime < stopBeforeDate) {
           hitBoundary = true;
           break;
@@ -166,7 +171,8 @@ async function getPostsChronological(subreddit, maxPosts, stopBeforeDate) {
         if (allPosts.length >= maxPosts) break;
       }
 
-      after = data?.data?.after;
+      lastAfter = data?.data?.after || null;
+      after = lastAfter;
       if (!after || hitBoundary) break;
 
     } catch (e) {
@@ -175,18 +181,27 @@ async function getPostsChronological(subreddit, maxPosts, stopBeforeDate) {
     }
   }
 
-  return allPosts;
+  return { posts: allPosts, nextCursor: lastAfter }; // ← CHANGED
 }
 
-// For SORT mode: fetch by sort type
-async function getPostsBySort(subreddit, maxPosts, sortBy, timeFilter) {
+// ← CHANGED: accepts initialAfter, returns { posts, nextCursor }
+async function getPostsBySort(subreddit, maxPosts, sortBy, timeFilter, initialAfter) {
   const allPosts = [];
-  let after = null;
+  let after = initialAfter || null;
+  let lastAfter = null;
 
-  const sortMap     = { hot: "hot", new: "new", top: "top", rising: "rising", best: "best" };
-  const sortEndpoint = sortMap[sortBy] || "new";
+  const sortMap = { hot: "hot", new: "new", top: "top", rising: "rising", best: "best" };
+  
+  let sortEndpoint = sortMap[sortBy] || "new";
+  // pagination safe sorts
+  const paginationSafe = ["new", "top", "hot"];
+
+if (!paginationSafe.includes(sortEndpoint)) {
+  sortEndpoint = "new";
+}
 
   while (allPosts.length < maxPosts) {
+
     try {
       let url = `https://www.reddit.com/r/${subreddit}/${sortEndpoint}.json?limit=100&raw_json=1`;
       if (sortBy === "top") url += `&t=${timeFilter}`;
@@ -201,7 +216,7 @@ async function getPostsBySort(subreddit, maxPosts, sortBy, timeFilter) {
         break;
       }
 
-      const data     = await res.json();
+      const data = await res.json();
       const children = data?.data?.children || [];
       if (children.length === 0) break;
 
@@ -212,7 +227,8 @@ async function getPostsBySort(subreddit, maxPosts, sortBy, timeFilter) {
         if (allPosts.length >= maxPosts) break;
       }
 
-      after = data?.data?.after;
+      lastAfter = data?.data?.after || null;
+      after = lastAfter;
       if (!after) break;
 
     } catch (e) {
@@ -221,31 +237,29 @@ async function getPostsBySort(subreddit, maxPosts, sortBy, timeFilter) {
     }
   }
 
-  return allPosts;
+  return { posts: allPosts, nextCursor: lastAfter }; // ← CHANGED
 }
 
-// Shared post builder
 function buildPost(p) {
   return {
-    id:           p.id            || "",
-    title:        p.title         || "",
-    author:       p.author        || "[deleted]",
-    score:        p.score         || 0,
-    upvote_ratio: p.upvote_ratio  || 0,
-    num_comments: p.num_comments  || 0,
-    created_utc:  new Date((p.created_utc || 0) * 1000).toISOString(),
-    url:          p.url           || "",
-    permalink:    p.permalink     || "",
-    selftext:     p.selftext      || "",
-    is_self:      p.is_self       || false,
-    flair:        p.link_flair_text || "N/A",
-    domain:       p.domain        || "reddit.com",
-    thumbnail:    p.thumbnail     || "",
-    awards:       p.total_awards_received || 0
+    id: p.id || "",
+    title: p.title || "",
+    author: p.author || "[deleted]",
+    score: p.score || 0,
+    upvote_ratio: p.upvote_ratio || 0,
+    num_comments: p.num_comments || 0,
+    created_utc: new Date((p.created_utc || 0) * 1000).toISOString(),
+    url: p.url || "",
+    permalink: p.permalink || "",
+    selftext: p.selftext || "",
+    is_self: p.is_self || false,
+    flair: p.link_flair_text || "N/A",
+    domain: p.domain || "reddit.com",
+    thumbnail: p.thumbnail || "",
+    awards: p.total_awards_received || 0
   };
 }
 
-// Fetch comments for a post
 async function getComments(permalink, limit) {
   try {
     const res = await fetch(
@@ -255,28 +269,28 @@ async function getComments(permalink, limit) {
 
     if (!res.ok) return [];
 
-    const data         = await res.json();
+    const data = await res.json();
     const commentsData = data[1]?.data?.children || [];
-    const comments     = [];
+    const comments = [];
 
     function extract(list, depth) {
       if (comments.length >= limit) return;
       for (const child of list) {
         if (child.kind !== "t1") continue;
-        const c    = child.data;
+        const c = child.data;
         const body = c.body || "";
         if (!body || body === "[deleted]" || body === "[removed]") continue;
 
         comments.push({
-          id:           c.id            || "",
-          author:       c.author        || "[deleted]",
-          text:         body,
-          score:        c.score         || 0,
-          created_utc:  new Date((c.created_utc || 0) * 1000).toISOString(),
+          id: c.id || "",
+          author: c.author || "[deleted]",
+          text: body,
+          score: c.score || 0,
+          created_utc: new Date((c.created_utc || 0) * 1000).toISOString(),
           depth,
-          parent_id:    c.parent_id     || "",
-          is_submitter: c.is_submitter  || false,
-          awards:       c.total_awards_received || 0
+          parent_id: c.parent_id || "",
+          is_submitter: c.is_submitter || false,
+          awards: c.total_awards_received || 0
         });
 
         if (depth < 2 && comments.length < limit && c.replies?.data) {
